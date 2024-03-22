@@ -1,91 +1,89 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-
+import (
+	"fmt"
+	"math/rand"
+	"os"
+	"time"
+)
 
 //
-// Map functions return a slice of KeyValue.
+// Definition of Worker of Mapreduce.
 //
+
+type WorkerId string
+
+// KeyValue Map functions return a slice of KeyValue.
 type KeyValue struct {
 	Key   string
 	Value string
 }
 
-//
-// use ihash(key) % NReduce to choose the reduce
-// task number for each KeyValue emitted by Map.
-//
-func ihash(key string) int {
-	h := fnv.New32a()
-	h.Write([]byte(key))
-	return int(h.Sum32() & 0x7fffffff)
-}
-
-
-//
+// Worker main entrance of the Worker.
 // main/mrworker.go calls this function.
-//
-func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
-
-	// Your worker implementation here.
-
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
-
-}
-
-//
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
-
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
+func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
+	workerId := GenerateWorkerId()
+	DPrintf("W, Worker, A Worker starting, WID: %s.", workerId)
+	nta := NewTaskArgs{workerId}
+	for { // Infinity loop to ask for a new task when available.
+		ntr := NewTaskReply{}
+		DPrintf("W, Worker, Ask for task, %s.", nta.str())
+		ok := call(RPCNameNewTask, &nta, &ntr)
+		if !ok {
+			DPrintf("W, Worker, Wait for RPC error, %s.", nta.str())
+			ntr.Task.Mode = Wait
+		}
+		DPrintf("W, Worker, Got task, %s.", ntr.str())
+		switch ntr.Task.Mode { // Switch by reply from RPCServer
+		case Mapper: // Go to mapper logic.
+			mapper(mapf, &ntr.Task)
+		case Reducer: // Go to reducer logic.
+			reducer(reducef, &ntr.Task)
+		case Wait:
+			DPrintf("W, Worker, Wait, %s.", nta.str())
+			time.Sleep(time.Second) // Sleep for 1 sec
+		case Quit:
+			DPrintf("W, Worker, Quit, %s.", nta.str())
+			return
+		default:
+			continue
+		}
 	}
 }
 
-//
-// send an RPC request to the coordinator, wait for the response.
-// usually returns true.
-// returns false if something goes wrong.
-//
-func call(rpcname string, args interface{}, reply interface{}) bool {
-	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
-	sockname := coordinatorSock()
-	c, err := rpc.DialHTTP("unix", sockname)
+// reportRes a helper function for worker.
+// Send Q and taskID to RPCServer server when the current task is finished.
+func reportRes(task *Task, status TaskStatus) {
+	task.Status = status
+	rta := ReturnTaskArgs{*task}
+	rtr := ReturnTaskReply{}
+	call(RPCNameReturnTask, &rta, &rtr)
+	DPrintf("W, Report Res send worker result. %s", task.str())
+}
+
+// atomicRename rename the tmpFile to filename.
+// Remove tmpFile if the file already exists.
+func atomicRename(tmpFile *os.File, filename string, task *Task) bool {
+	DPrintf("W, Atomic Rename start, %s, file name: %s", task.str(), filename)
+	err := os.Rename(tmpFile.Name(), filename)
 	if err != nil {
-		log.Fatal("dialing:", err)
+		DPrintf("W, Atomic Rename, error when rename the temp file, %s, "+
+			"file name: %s, error is %v", task.str(), filename, err)
+		if os.IsExist(err) { // If target file exists, means that the task is duplicated.
+			DPrintf("W, Atomic Rename skip because file existed, %s, file name: %s",
+				task.str(), filename)
+			os.Remove(tmpFile.Name())
+			return true
+		}
+		return false
 	}
-	defer c.Close()
+	DPrintf("W, Atomic Rename finished, %s, file name: %s", task.str(), filename)
+	return true
+}
 
-	err = c.Call(rpcname, args, reply)
-	if err == nil {
-		return true
-	}
-
-	fmt.Println(err)
-	return false
+// GenerateWorkerId return an Unique value as worker id.
+func GenerateWorkerId() WorkerId {
+	rand.New(rand.NewSource(time.Now().UnixNano()))
+	uniqueValue := fmt.Sprintf("%d-%d", time.Now().UnixNano(), rand.Intn(1000))
+	return WorkerId(uniqueValue)
 }

@@ -4,94 +4,93 @@ import (
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
-	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
-const Debug = false
+//
+// Definition of the Server in the Raft KV store.
+// Main entry point of this package.
+//
 
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug {
-		log.Printf(format, a...)
-	}
-	return
-}
-
-
-type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
-}
+const Timeout = 500 * time.Millisecond // The timeout for Raft peer to get majority.
 
 type KVServer struct {
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	me      int
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
 	dead    int32 // set by Kill()
 
-	maxraftstate int // snapshot if log grows this big
+	maxraftstate int               // snapshot if log grows this big
+	persister    *raft.Persister   // raft's persister
+	lastApplied  int               // lastApplied index of a Raft peer.
+	kv           map[string]string // kv storage.
 
-	// Your definitions here.
+	// map: Clerk: {chan, Reply} includes the processing task as a leader.
+	// There is at most ONE processing task for a Clerk since Clerk is synchronized.
+	leaderTasks map[int64]*OpTracker
+	// map: Clerk: Reply includes every Clerk's latest processed task.
+	// Only cache ONE processed task for each Clerk because Clerk is synchronized so the task Id is increment.
+	cachedTasks map[int64]Reply
 }
 
+// StartKVServer constructor of KVServer.
+// KVServer is the state machine in a Raft System. The main logic is:
+// 1. Clerk calls the KVServer to send command.
+// 2. KVServer forwards the command to Raft peer to get majority when it is a leader.
+// 3. KVServer receives commands after getting majority by ApplyCh from Raft peer, then apply to KVStore.
+// Then return to Clerk when it is a leader.
+// 4. Also includes logic about: Timeout detection, Snapshot for log compression.
+func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
+	labgob.Register(Op{})
+	labgob.Register(Reply{})
+	kv := new(KVServer)
+	kv.me = me
+	kv.maxraftstate = maxraftstate
+	kv.persister = persister
 
-func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.leaderTasks = make(map[int64]*OpTracker)
+	kv.cachedTasks = make(map[int64]Reply)
+	kv.kv = make(map[string]string)
+	kv.installSnapshotFromPersist()
+	go kv.ticker()
+	DPrintf("Server-%d, Started.", kv.me)
+	return kv
 }
 
-func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
-}
-
-// the tester calls Kill() when a KVServer instance won't
-// be needed again. for your convenience, we supply
-// code to set rf.dead (without needing a lock),
-// and a killed() method to test rf.dead in
-// long-running loops. you can also add your own
-// code to Kill(). you're not required to do anything
-// about this, but it may be convenient (for example)
-// to suppress debug output from a Kill()ed instance.
+// Kill the tester calls Kill() when a KVServer instance won't be needed again.
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
-	// Your code here, if desired.
 }
 
+// killed return if the server is killed.
 func (kv *KVServer) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z == 1
 }
 
-// servers[] contains the ports of the set of
-// servers that will cooperate via Raft to
-// form the fault-tolerant key/value service.
-// me is the index of the current server in servers[].
-// the k/v server should store snapshots through the underlying Raft
-// implementation, which should call persister.SaveStateAndSnapshot() to
-// atomically save the Raft state along with the snapshot.
-// the k/v server should snapshot when Raft's saved state exceeds maxraftstate bytes,
-// in order to allow Raft to garbage-collect its log. if maxraftstate is -1,
-// you don't need to snapshot.
-// StartKVServer() must return quickly, so it should start goroutines
-// for any long-running work.
-func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
-	// call labgob.Register on structures you want
-	// Go's RPC library to marshall/unmarshall.
-	labgob.Register(Op{})
-
-	kv := new(KVServer)
-	kv.me = me
-	kv.maxraftstate = maxraftstate
-
-	// You may need initialization code here.
-
-	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-
-	// You may need initialization code here.
-
-	return kv
+// performKV perform KV store
+// UnLocked method, so the caller should hold the Locker.
+func (kv *KVServer) performKv(op *Op, tracker *OpTracker) {
+	DPrintf("Server-%d, PK, ready for KV: %s.", kv.me, tracker)
+	switch op.OpType {
+	case TypeGet:
+		v, ok := kv.kv[op.Key]
+		if ok {
+			tracker.OpReply.Value = v
+		} else {
+			tracker.OpReply.Result = ErrNoKey
+			tracker.OpReply.Value = ""
+		}
+	case TypePut:
+		kv.kv[op.Key] = op.Value
+	case TypeAppend:
+		kv.kv[op.Key] += op.Value
+	}
+	DPrintf("Server-%d, PK, Done: %s, %s.", kv.me, op, tracker)
 }
